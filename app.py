@@ -4,985 +4,526 @@
 import os
 import sys
 import re
-import json
-import time
+import socket
 import base64
 import random
-import string
+import secrets
 import shutil
-import platform
-import signal
-import threading
-import subprocess
-import datetime
-import requests
-from pathlib import Path
-from urllib.parse import urlparse, quote
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from cryptography.hazmat.primitives.asymmetric import x25519, ec
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography import x509
-from cryptography.x509.oid import NameOID
+import hashlib
+import asyncio
+import logging
+import uuid as uuidlib
 
-# =========================== 环境变量 ===========================
-UPLOAD_URL = os.environ.get('UPLOAD_URL', '')          # 节点或订阅上传地址
-PROJECT_URL = os.environ.get('PROJECT_URL', '')        # 项目url,用于自动保活或上传订阅
-AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true'  # true开启自动保活,默认关闭
-FILE_PATH = os.environ.get('FILE_PATH', '.cache')      # 运行目录,sub.txt保存路径
-SUB_PATH = os.environ.get('SUB_PATH', 'sub')           # 订阅token
-UUID = os.environ.get('UUID', '20e6e496-cf19-45c8-b883-14f5e11cd9f1')  # UUID
-NEZHA_SERVER = os.environ.get('NEZHA_SERVER', '')      # 哪吒面板域名,v0：nezha.xxx.com  v1: nezha.xxx.com:8008
-NEZHA_PORT = os.environ.get('NEZHA_PORT', '')          # v1留空, v0填agent通信端口
-NEZHA_KEY = os.environ.get('NEZHA_KEY', '')            # v1的NZ_CLIENT_SECRET或v0 agent密钥
-ARGO_DOMAIN = os.environ.get('ARGO_DOMAIN', '')        # Argo固定隧道域名,留空使用临时隧道
-ARGO_AUTH = os.environ.get('ARGO_AUTH', '')            # Argo固定隧道token或json,留空使用临时隧道
-ARGO_PORT = int(os.environ.get('ARGO_PORT', '8001'))   # Argo隧道端口
-S5_PORT = os.environ.get('S5_PORT', '')                # socks5端口,留空不开启
-HY2_PORT = os.environ.get('HY2_PORT', '')              # hy2端口,留空不开启
-REALITY_PORT = os.environ.get('REALITY_PORT', '')      # reality端口,留空不开启
-CFIP = os.environ.get('CFIP', 'cf.877774.xyz')         # 优选ip或域名
-CFPORT = int(os.environ.get('CFPORT', '443'))          # 优选端口
-NAME = os.environ.get('NAME', '')                      # 节点名称
-CHAT_ID = os.environ.get('CHAT_ID', '')                # Telegram chat_id
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')            # Telegram bot_token
-PORT = int(os.environ.get('PORT') or '3000')           # http订阅端口
-SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志,默认显示，no/false/disable 不显示
+import aiohttp
+from aiohttp import web
 
-# =========================== 日志控制 ===========================
-def log(msg):
-    if SHOW_LOG:
-        print(msg)
+# ---- configuration -------------------------------------------------------
+ENV = os.environ
 
-def log_error(msg):
-    if SHOW_LOG:
-        print(msg, file=sys.stderr)
 
-def always_log(msg):
-    sys.stdout.write(msg + '\n')
-    sys.stdout.flush()
-
-# =========================== 全局变量 ===========================
-private_key = ''
-public_key = ''
-sub_txt_content = ''
-FILE_PATH = Path(FILE_PATH).resolve()
-
-def generate_random_name(length=6):
-    return ''.join(random.choices(string.ascii_lowercase, k=length))
-
-web_name = generate_random_name()
-bot_name = generate_random_name()
-npm_name = generate_random_name()
-php_name = generate_random_name()
-
-web_path = FILE_PATH / web_name
-bot_path = FILE_PATH / bot_name
-npm_path = FILE_PATH / npm_name
-php_path = FILE_PATH / php_name
-sub_path = FILE_PATH / 'sub.txt'
-list_path = FILE_PATH / 'list.txt'
-boot_log_path = FILE_PATH / 'boot.log'
-config_path = FILE_PATH / 'config.json'
-nezha_config_path = FILE_PATH / 'config.yaml'
-cert_path = FILE_PATH / 'cert.pem'
-key_path = FILE_PATH / 'private.key'
-
-# =========================== 端口检查 ===========================
-def is_valid_port(port):
+def int_env(raw, default):
+    """非负整数 env：缺失/非法/负数一律回退默认值。"""
     try:
-        if port is None or port == '':
-            return False
-        port_num = int(port)
-        if port_num < 1 or port_num > 65535:
-            return False
-        return True
-    except (ValueError, TypeError):
+        n = int(str(raw).strip())
+        return n if n >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+NODE_ID = ENV.get('UUID') or str(uuidlib.uuid4())
+NODE_ID_HEX = NODE_ID.replace('-', '')
+WSPATH = ENV.get('WSPATH') or secrets.token_hex(8)
+SUB_PATH = ENV.get('SUB_PATH', '')            # 空 = 不启用 HTTP 订阅路由（opt-in）
+NAME = ENV.get('NAME', '')
+DOMAIN = ENV.get('DOMAIN', '')
+TG_TOKEN = ENV.get('TG_BOT_TOKEN', '')
+TG_CHAT = ENV.get('TG_CHAT_ID', '')
+TG_API_BASE = (ENV.get('TG_API_BASE') or 'https://api.telegram.org').rstrip('/')
+SERVER_HEADER = ENV.get('SERVER_HEADER') or 'nginx/1.24.0'
+SITE_TITLE = ENV.get('SITE_TITLE', '')
+SITE_THEME = ENV.get('SITE_THEME', '')
+SELF_DESTRUCT = ENV.get('SELF_DESTRUCT', 'true') != 'false'
+SELF_DESTRUCT_AFTER = int_env(ENV.get('SELF_DESTRUCT_AFTER'), 90)
+PORT = int_env(ENV.get('SERVER_PORT') or ENV.get('PORT'), 8501)
+
+IP_RE = re.compile(r'^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$')
+
+SENSITIVE_ENV = [
+    'UUID', 'WSPATH', 'SUB_PATH', 'NAME', 'DOMAIN',
+    'TG_BOT_TOKEN', 'TG_CHAT_ID', 'TG_API_BASE', 'SERVER_HEADER', 'SITE_TITLE',
+    'SITE_THEME', 'SELF_DESTRUCT', 'SELF_DESTRUCT_AFTER', 'PORT', 'SERVER_PORT',
+]
+
+# 速率测试域名拦截（防止节点被 speedtest 探测流量打爆 / 暴露带宽特征）
+PROTECTED_HOSTS = [
+    'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
+    'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org',
+]
+
+
+def is_protected_host(host):
+    if not host:
         return False
+    h = str(host).lower()
+    return any(h == b or h.endswith('.' + b) for b in PROTECTED_HOSTS)
 
-# =========================== X25519 密钥对生成 ===========================
-def generate_x25519_keypair():
-    """使用 cryptography 库生成 X25519 密钥对,返回 base64url 编码的私钥和公钥"""
-    priv = x25519.X25519PrivateKey.generate()
-    pub = priv.public_key()
-    priv_bytes = priv.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    pub_bytes = pub.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
-    return {
-        'privateKey': base64.urlsafe_b64encode(priv_bytes).decode().rstrip('='),
-        'publicKey': base64.urlsafe_b64encode(pub_bytes).decode().rstrip('=')
-    }
 
-def generate_or_load_keypair():
-    """生成或加载 X25519 密钥对"""
-    global private_key, public_key
-    key_file_path = FILE_PATH / 'key.txt'
-    if key_file_path.exists():
-        content = key_file_path.read_text(encoding='utf-8')
-        priv_match = re.search(r'PrivateKey:\s*(.*)', content)
-        pub_match = re.search(r'PublicKey:\s*(.*)', content)
-        if priv_match and pub_match:
-            private_key = priv_match.group(1).strip()
-            public_key = pub_match.group(1).strip()
-            log(f'Private Key: {private_key}')
-            log(f'Public Key: {public_key}')
-            return
-    keypair = generate_x25519_keypair()
-    private_key = keypair['privateKey']
-    public_key = keypair['publicKey']
-    key_file_path.write_text(
-        f'PrivateKey: {private_key}\nPublicKey: {public_key}\n', encoding='utf-8')
-    log(f'Private Key: {private_key}')
-    log(f'Public Key: {public_key}')
+# ---- node identity (domain/port/tls) —— 无外呼，启动即定 -----------------
+# DOMAIN 为域名 → TLS:443；为 IPv4 → 直连:PORT。未设 DOMAIN 则节点不可用。
+meta_domain = ''
+meta_port = 443
+meta_tls = 'tls'
+meta_valid = False
+if DOMAIN:
+    meta_domain = DOMAIN
+    if IP_RE.match(DOMAIN):
+        meta_tls = 'none'
+        meta_port = PORT
+    else:
+        meta_tls = 'tls'
+        meta_port = 443
+    meta_valid = True
 
-# =========================== TLS 证书生成 ===========================
-FALLBACK_EC_KEY = (
-    '-----BEGIN EC PARAMETERS-----\n'
-    'BggqhkjOPQMBBw==\n'
-    '-----END EC PARAMETERS-----\n'
-    '-----BEGIN EC PRIVATE KEY-----\n'
-    'MHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/++siNnfBYsdUYoAoGCCqGSM49\n'
-    'AwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASANnngZreoQDF16ARa\n'
-    '/TsyLyFoPkhLxSbehH/NBEjHtSZGaDhMqQ==\n'
-    '-----END EC PRIVATE KEY-----\n'
-)
 
-FALLBACK_CERT = (
-    '-----BEGIN CERTIFICATE-----\n'
-    'MIIBejCCASGgAwIBAgIUfWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw\n'
-    'EzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwOTE4MTgyMDIyWhcNMzUwOTE2MTgy\n'
-    'MDIyWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH\n'
-    'A0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgDZ54Ga3qEAxdegEWv07Mi8h\n'
-    'aD5IS8Um3oR/zQRIx7UmRmg4TKmjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR\n'
-    'BfGbgkrMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgkrMNzAPBgNVHRMB\n'
-    'Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+\n'
-    'eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==\n'
-    '-----END CERTIFICATE-----\n'
-)
+# ---- subscription --------------------------------------------------------
+def build_subscription():
+    name_part = NAME or 'node'
+    tls_param = 'tls' if meta_tls == 'tls' else 'none'
+    ss_tls_param = 'tls;' if meta_tls == 'tls' else ''
+    vls = (f"vless://{NODE_ID}@{meta_domain}:{meta_port}?encryption=none&security={tls_param}"
+           f"&sni={meta_domain}&fp=chrome&type=ws&host={meta_domain}&path=%2F{WSPATH}#{name_part}")
+    tro = (f"trojan://{NODE_ID}@{meta_domain}:{meta_port}?security={tls_param}"
+           f"&sni={meta_domain}&fp=chrome&type=ws&host={meta_domain}&path=%2F{WSPATH}#{name_part}")
+    ss_mp = base64.b64encode(f"none:{NODE_ID}".encode()).decode()
+    ss = (f"ss://{ss_mp}@{meta_domain}:{meta_port}?plugin=v2ray-plugin;mode%3Dwebsocket;"
+          f"host%3D{meta_domain};path%3D%2F{WSPATH};{ss_tls_param}sni%3D{meta_domain};"
+          f"skip-cert-verify%3Dtrue;mux%3D0#{name_part}")
+    return vls + '\n' + tro + '\n' + ss
 
-def ensure_tls_certificates(cert_file, key_file):
-    """生成自签名 TLS 证书 (用于 Hysteria2)"""
-    if cert_file.exists() and key_file.exists():
+
+async def deliver():
+    if not meta_valid:
+        print('DOMAIN not set; subscription skipped', file=sys.stderr)
         return
-    cert_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        ec_private_key = ec.generate_private_key(ec.SECP256R1())
-        subject = issuer = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, 'bing.com')
-        ])
-        cert_obj = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(issuer)
-            .public_key(ec_private_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
-            .not_valid_after((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)).replace(tzinfo=None))
-            .sign(ec_private_key, hashes.SHA256())
-        )
-        key_pem = ec_private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        cert_pem = cert_obj.public_bytes(serialization.Encoding.PEM)
-        key_file.write_bytes(key_pem)
-        cert_file.write_bytes(cert_pem)
-    except Exception as e:
-        log_error(f'Failed to generate TLS certificate: {e}')
-        key_file.write_text(FALLBACK_EC_KEY, encoding='utf-8')
-        cert_file.write_text(FALLBACK_CERT, encoding='utf-8')
+    sub = build_subscription()
+    b64 = base64.b64encode(sub.encode()).decode()
+    if TG_TOKEN and TG_CHAT:
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{TG_API_BASE}/bot{TG_TOKEN}/sendMessage",
+                    json={'chat_id': TG_CHAT, 'text': b64},
+                ) as r:
+                    if r.status == 200:
+                        print('subscription delivered via telegram')
+                        return
+                    print(f'telegram delivery failed (http {r.status}); printing fallback', file=sys.stderr)
+        except Exception:
+            print('telegram delivery error; printing fallback', file=sys.stderr)
+    print('subscription (base64):\n' + b64)
+    print(sub)
 
-# =========================== 证书指纹计算 ===========================
-def get_certificate_fingerprint(cert_file):
-    """计算证书的 SHA-256 指纹,优先用 openssl,不可用时用 cryptography 兜底"""
+
+# ---- DNS -----------------------------------------------------------------
+_DNS_CACHE = {}
+_DNS_TTL = 10 * 60  # seconds
+_DOH_ENDPOINTS = [
+    'https://dns.google/resolve',
+    'https://1.1.1.1/dns-query',
+    'https://cloudflare-dns.com/dns-query',
+]
+
+
+def _pick_a_record(answer):
+    if isinstance(answer, list):
+        for a in answer:
+            if a.get('type') == 1:
+                return a.get('data')
+    return None
+
+
+async def resolve_host(host):
+    if IP_RE.match(host):
+        return host
+    hit = _DNS_CACHE.get(host)
+    now = asyncio.get_event_loop().time()
+    if hit and hit[1] > now:
+        return hit[0]
+    # 系统 DNS 优先（53 端口，外观正常）
     try:
-        result = subprocess.run(
-            ['openssl', 'x509', '-noout', '-fingerprint', '-sha256', '-in', str(cert_file)],
-            capture_output=True, text=True, timeout=3
-        )
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            match = re.search(r'=(.+)$', output)
-            if match and match.group(1):
-                return match.group(1).upper()
+        loop = asyncio.get_event_loop()
+        infos = await loop.getaddrinfo(host, None, family=socket.AF_INET)
+        if infos:
+            ip = infos[0][4][0]
+            if len(_DNS_CACHE) >= 512:
+                _DNS_CACHE.clear()
+            _DNS_CACHE[host] = (ip, now + _DNS_TTL)
+            return ip
     except Exception:
-        pass
-    try:
-        with open(cert_file, 'rb') as f:
-            cert_data = f.read()
-        cert = x509.load_pem_x509_certificate(cert_data)
-        fingerprint = cert.fingerprint(hashes.SHA256())
-        return ':'.join(f'{b:02X}' for b in fingerprint)
-    except Exception as e:
-        log_error(f'Failed to calculate certificate fingerprint: {e}')
-        return ''
+        pass  # 走 DoH 回退
+    for base in _DOH_ENDPOINTS:
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    base, params={'name': host, 'type': 'A'},
+                    headers={'accept': 'application/dns-json', 'User-Agent': 'Mozilla/5.0'},
+                ) as r:
+                    d = await r.json(content_type=None)
+                    ip = _pick_a_record(d.get('Answer'))
+                    if ip:
+                        if len(_DNS_CACHE) >= 512:
+                            _DNS_CACHE.clear()
+                        _DNS_CACHE[host] = (ip, now + _DNS_TTL)
+                        return ip
+        except Exception:
+            continue  # 下一端点
+    raise OSError(f'failed to resolve {host}')
 
-# =========================== 创建运行文件夹 ===========================
-def create_directory():
-    if not SHOW_LOG:
-        print('\033c', end='')
-    FILE_PATH.mkdir(parents=True, exist_ok=True)
-    # log(f'{FILE_PATH} is ready')
 
-# =========================== 删除旧节点 ===========================
-def delete_nodes():
+# ---- tunnel --------------------------------------------------------------
+async def open_tunnel(ws, host, port, payload):
+    # 解析失败回退连原始 host（与 node 一致）
     try:
-        if not UPLOAD_URL:
-            return
-        if not sub_path.exists():
-            return
-        content = sub_path.read_text(encoding='utf-8')
-        decoded = base64.b64decode(content).decode('utf-8')
-        nodes = [line for line in decoded.split('\n')
-                 if re.match(r'(vless|vmess|trojan|hysteria2|socks)://', line)]
-        if not nodes:
-            return
-        requests.post(f'{UPLOAD_URL}/api/delete-nodes',
-                       json={'nodes': nodes}, timeout=10)
+        target = await resolve_host(host)
     except Exception:
-        pass
-
-# =========================== 清理历史文件 ===========================
-def cleanup_old_files():
-    """清理 FILE_PATH 目录下的所有文件, 保留 key.txt/cert.pem/private.key"""
-    # key.txt: Reality 密钥对, cert.pem/private.key: Hysteria2 证书, 删除后重启指纹变化导致节点失效
-    preserve_files = {FILE_PATH / 'key.txt', cert_path, key_path}
+        target = host
     try:
-        for item in FILE_PATH.iterdir():
-            if item in preserve_files:
-                continue
+        reader, writer = await asyncio.open_connection(target, port)
+    except Exception:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        return
+    if payload:
+        try:
+            writer.write(payload)
+            await writer.drain()
+        except Exception:
+            pass
+
+    async def ws_to_tcp():
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    writer.write(msg.data)
+                    await writer.drain()
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                  aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except Exception:
+            pass
+        finally:
             try:
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    shutil.rmtree(item)
+                writer.close()
             except Exception:
                 pass
-    except Exception:
-        pass
 
-# =========================== 判断系统架构 ===========================
-def get_system_architecture():
-    arch = platform.machine().lower()
-    if arch in ('arm', 'arm64', 'aarch64'):
-        return 'arm'
-    return 'amd'
-
-# =========================== 下载文件 ===========================
-def download_file(file_name, file_url):
-    file_path = FILE_PATH / file_name
-    try:
-        response = requests.get(file_url, stream=True, timeout=180)
-        response.raise_for_status()
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        log(f'Download {file_name} successfully')
-        return True
-    except Exception as e:
-        log_error(f'Download {file_name} failed: {e}')
+    async def tcp_to_ws():
         try:
-            file_path.unlink()
-        except FileNotFoundError:
-            pass
-        return False
-
-def download_all_files():
-    """下载所需二进制文件"""
-    architecture = get_system_architecture()
-    if architecture == 'arm':
-        base_urls = ['https://arm64.oooen.com', 'https://arm64.ssss.nyc.mn']
-    else:
-        base_urls = ['https://amd64.oooen.com', 'https://amd64.ssss.nyc.mn']
-
-    downloads = [
-        {'name': web_name, 'path': 'web'},
-        {'name': bot_name, 'path': 'bot'},
-    ]
-
-    if NEZHA_SERVER and NEZHA_KEY:
-        if NEZHA_PORT:
-            downloads.append({'name': npm_name, 'path': 'agent'})
-        else:
-            downloads.append({'name': php_name, 'path': 'v1'})
-    else:
-        log('NEZHA variable is empty, skipping nezha-agent')
-
-    for item in downloads:
-        downloaded = False
-        for index, base_url in enumerate(base_urls):
-            url = f'{base_url}/{item["path"]}'
-            if download_file(item['name'], url):
-                downloaded = True
-                break
-            if index + 1 < len(base_urls):
-                log(f'Retrying {item["name"]} from backup source')
-        if not downloaded:
-            log_error(f'Error downloading {item["name"]}: all sources failed')
-
-# =========================== 授权文件执行权限 ===========================
-def authorize_files(file_names):
-    for name in file_names:
-        file_path = FILE_PATH / name
-        if file_path.exists():
-            try:
-                os.chmod(str(file_path), 0o775)
-                log(f'Empowerment success for {name}: 775')
-            except Exception as e:
-                log_error(f'Empowerment failed for {name}: {e}')
-
-# =========================== Argo 隧道配置 ===========================
-def argo_type():
-    if not ARGO_AUTH or not ARGO_DOMAIN:
-        log('ARGO_DOMAIN or ARGO_AUTH variable is empty, use quick tunnels')
-        return
-
-    if 'TunnelSecret' in ARGO_AUTH:
-        (FILE_PATH / 'tunnel.json').write_text(ARGO_AUTH, encoding='utf-8')
-        tunnel_id = ARGO_AUTH.split('"')[11]
-        tunnel_yaml = f"""
-tunnel: {tunnel_id}
-credentials-file: {FILE_PATH / 'tunnel.json'}
-protocol: http2
-
-ingress:
-  - hostname: {ARGO_DOMAIN}
-    service: http://localhost:{ARGO_PORT}
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-"""
-        (FILE_PATH / 'tunnel.yml').write_text(tunnel_yaml, encoding='utf-8')
-    else:
-        log(f'Using token connect to tunnel, please set {ARGO_PORT} in cloudflare')
-
-# =========================== Nezha 配置生成 ===========================
-def generate_nezha_config():
-    if not NEZHA_SERVER or not NEZHA_KEY:
-        return
-    if NEZHA_PORT:
-        return  # v0 模式不需要 config.yaml
-
-    nzport = NEZHA_SERVER.split(':')[-1] if ':' in NEZHA_SERVER else ''
-    tls_ports = {'443', '8443', '2096', '2087', '2083', '2053'}
-    nezhatls = 'true' if nzport in tls_ports else 'false'
-    config_yaml = f"""client_secret: {NEZHA_KEY}
-debug: false
-disable_auto_update: true
-disable_command_execute: false
-disable_force_update: true
-disable_nat: false
-disable_send_query: false
-gpu: false
-insecure_tls: true
-ip_report_period: 1800
-report_delay: 4
-server: {NEZHA_SERVER}
-skip_connection_count: true
-skip_procs_count: true
-temperature: false
-tls: {nezhatls}
-use_gitee_to_upgrade: false
-use_ipv6_country_code: false
-uuid: {UUID}"""
-    nezha_config_path.write_text(config_yaml, encoding='utf-8')
-
-# =========================== Xray 配置生成 ===========================
-def generate_xray_config():
-    config = {
-        "log": {
-            "access": "/dev/null",
-            "error": "/dev/null",
-            "loglevel": "none"
-        },
-        "inbounds": [
-            {
-                "tag": "vless-fallback-in",
-                "listen": "::",
-                "port": ARGO_PORT,
-                "protocol": "vless",
-                "settings": {
-                    "clients": [{"id": UUID, "flow": "xtls-rprx-vision"}],
-                    "decryption": "none",
-                    "fallbacks": [
-                        {"dest": 51001},
-                        {"path": "/vless-argo", "dest": 51002},
-                        {"path": "/vmess-argo", "dest": 51003},
-                        {"path": "/trojan-argo", "dest": 51004}
-                    ]
-                },
-                "streamSettings": {"network": "tcp"}
-            },
-            {
-                "tag": "vless-tcp-in",
-                "port": 51001,
-                "listen": "127.0.0.1",
-                "protocol": "vless",
-                "settings": {
-                    "clients": [{"id": UUID}],
-                    "decryption": "none"
-                },
-                "streamSettings": {"network": "tcp", "security": "none"}
-            },
-            {
-                "tag": "vless-ws-in",
-                "port": 51002,
-                "listen": "127.0.0.1",
-                "protocol": "vless",
-                "settings": {
-                    "clients": [{"id": UUID, "level": 0}],
-                    "decryption": "none"
-                },
-                "streamSettings": {
-                    "network": "ws",
-                    "security": "none",
-                    "wsSettings": {"path": "/vless-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
-                }
-            },
-            {
-                "tag": "vmess-ws-in",
-                "port": 51003,
-                "listen": "127.0.0.1",
-                "protocol": "vmess",
-                "settings": {
-                    "clients": [{"id": UUID, "alterId": 0}]
-                },
-                "streamSettings": {
-                    "network": "ws",
-                    "wsSettings": {"path": "/vmess-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
-                }
-            },
-            {
-                "tag": "trojan-ws-in",
-                "port": 51004,
-                "listen": "127.0.0.1",
-                "protocol": "trojan",
-                "settings": {
-                    "clients": [{"password": UUID}]
-                },
-                "streamSettings": {
-                    "network": "ws",
-                    "security": "none",
-                    "wsSettings": {"path": "/trojan-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
-                }
-            }
-        ],
-        "dns": {"servers": ["https+local://8.8.8.8/dns-query"]},
-        "outbounds": [
-            {"protocol": "freedom", "tag": "direct"},
-            {"protocol": "blackhole", "tag": "block"}
-        ]
-    }
-
-    # VLESS Reality 配置
-    if is_valid_port(REALITY_PORT):
-        config["inbounds"].append({
-            "tag": "vless-reality-in",
-            "listen": "::",
-            "port": int(REALITY_PORT),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": UUID, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "raw",
-                "security": "reality",
-                "realitySettings": {
-                    "show": False,
-                    "dest": "www.iij.ad.jp:443",
-                    "xver": 0,
-                    "serverNames": ["www.iij.ad.jp"],
-                    "privateKey": private_key,
-                    "shortIds": [""]
-                }
-            }
-        })
-
-    # Hysteria2 配置
-    if is_valid_port(HY2_PORT):
-        config["inbounds"].append({
-            "tag": "hysteria-in",
-            "listen": "::",
-            "port": int(HY2_PORT),
-            "protocol": "hysteria",
-            "settings": {
-                "version": 2,
-                "clients": [{"auth": UUID}]
-            },
-            "streamSettings": {
-                "network": "hysteria",
-                "hysteriaSettings": {
-                    "version": 2,
-                    "masquerade": {"type": "proxy", "url": "https://bing.com"}
-                },
-                "security": "tls",
-                "tlsSettings": {
-                    "alpn": ["h3"],
-                    "certificates": [
-                        {
-                            "certificateFile": str(cert_path),
-                            "keyFile": str(key_path)
-                        }
-                    ]
-                }
-            }
-        })
-
-    # SOCKS5 配置
-    if is_valid_port(S5_PORT):
-        config["inbounds"].append({
-            "tag": "s5-in",
-            "listen": "::",
-            "port": int(S5_PORT),
-            "protocol": "socks",
-            "settings": {
-                "auth": "password",
-                "accounts": [{"user": UUID[:8], "pass": UUID[-12:]}],
-                "udp": True
-            }
-        })
-
-    config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
-
-# =========================== 执行命令 ===========================
-def exec_cmd(command):
-    try:
-        process = subprocess.Popen(
-            command, shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = process.communicate()
-        return stdout + stderr
-    except Exception as e:
-        log_error(f'Error executing command: {e}')
-        return str(e)
-
-# =========================== 下载并运行 ===========================
-def download_files_and_run():
-    architecture = get_system_architecture()
-
-    # 下载文件
-    download_all_files()
-
-    # 授权执行权限
-    files_to_authorize = [web_name, bot_name]
-    if NEZHA_SERVER and NEZHA_KEY:
-        if NEZHA_PORT:
-            files_to_authorize.append(npm_name)
-        else:
-            files_to_authorize.append(php_name)
-    authorize_files(files_to_authorize)
-
-    # 生成 Nezha 配置
-    generate_nezha_config()
-
-    # 运行 Nezha
-    if NEZHA_SERVER and NEZHA_PORT and NEZHA_KEY:
-        tls_ports = ['443', '8443', '2096', '2087', '2083', '2053']
-        nezha_tls = '--tls' if NEZHA_PORT in tls_ports else ''
-        command = f"nohup {npm_path} -s {NEZHA_SERVER}:{NEZHA_PORT} -p {NEZHA_KEY} {nezha_tls} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &"
-        try:
-            exec_cmd(command)
-            log(f'{npm_name} is running')
-            time.sleep(1)
-        except Exception as e:
-            log_error(f'npm running error: {e}')
-    elif NEZHA_SERVER and NEZHA_KEY:
-        command = f'nohup {php_path} -c "{nezha_config_path}" >/dev/null 2>&1 &'
-        try:
-            exec_cmd(command)
-            log(f'{php_name} is running')
-            time.sleep(1)
-        except Exception as e:
-            log_error(f'php running error: {e}')
-    else:
-        log('NEZHA variable is empty, skipping running')
-
-    # 运行 Xray
-    command = f'nohup {web_path} -c {config_path} >/dev/null 2>&1 &'
-    try:
-        exec_cmd(command)
-        log(f'{web_name} is running')
-        time.sleep(1)
-    except Exception as e:
-        log_error(f'web running error: {e}')
-
-    # 运行 Cloudflared
-    if bot_path.exists():
-        if re.match(r'^[A-Z0-9a-z=]{120,250}$', ARGO_AUTH):
-            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {ARGO_AUTH}"
-        elif "TunnelSecret" in ARGO_AUTH:
-            args = f"tunnel --edge-ip-version auto --config {FILE_PATH / 'tunnel.yml'} run"
-        else:
-            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{ARGO_PORT}"
-
-        try:
-            exec_cmd(f"nohup {bot_path} {args} >/dev/null 2>&1 &")
-            log(f'{bot_name} is running')
-            time.sleep(2)
-        except Exception as e:
-            log_error(f'Error executing command: {e}')
-
-    time.sleep(5)
-
-# =========================== 提取隧道域名 ===========================
-def extract_domains():
-    argo_domain = None
-
-    if ARGO_AUTH and ARGO_DOMAIN:
-        argo_domain = ARGO_DOMAIN
-        log(f'ARGO_DOMAIN: {argo_domain}')
-        generate_links(argo_domain)
-    else:
-        try:
-            if boot_log_path.exists():
-                file_content = boot_log_path.read_text(encoding='utf-8')
-                lines = file_content.split('\n')
-                argo_domains = []
-
-                for line in lines:
-                    domain_match = re.search(r'https?://([^ ]*trycloudflare\.com)/?', line)
-                    if domain_match:
-                        domain = domain_match.group(1)
-                        argo_domains.append(domain)
-
-                if argo_domains:
-                    argo_domain = argo_domains[0]
-                    log(f'ArgoDomain: {argo_domain}')
-                    generate_links(argo_domain)
-                else:
-                    log('ArgoDomain not found, re-running bot to obtain ArgoDomain')
-                    try:
-                        boot_log_path.unlink()
-                    except FileNotFoundError:
-                        pass
-
-                    try:
-                        exec_cmd(f'pkill -f "[{bot_name[0]}]{bot_name[1:]}" > /dev/null 2>&1')
-                    except Exception:
-                        pass
-
-                    time.sleep(3)
-                    args = f'tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{ARGO_PORT}'
-                    exec_cmd(f'nohup {bot_path} {args} >/dev/null 2>&1 &')
-                    log(f'{bot_name} is running')
-                    time.sleep(6)
-                    extract_domains()
-        except Exception as e:
-            log_error(f'Error reading boot.log: {e}')
-
-# =========================== 获取 ISP 信息 ===========================
-def get_meta_info():
-    try:
-        resp = requests.get('https://api.ip.sb/geoip',
-                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
-        data = resp.json()
-        if data.get('country_code') and data.get('isp'):
-            return f"{data['country_code']}-{data['isp']}".replace(' ', '_')
-    except Exception:
-        pass
-    try:
-        resp = requests.get('http://ip-api.com/json',
-                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
-        data = resp.json()
-        if data.get('status') == 'success' and data.get('countryCode') and data.get('org'):
-            return f"{data['countryCode']}-{data['org']}".replace(' ', '_')
-    except Exception:
-        pass
-    return 'Unknown'
-
-# =========================== 获取服务器公网 IP ===========================
-def get_server_ip():
-    server_ip = ''
-    try:
-        resp = requests.get('http://ipv4.ip.sb', timeout=3)
-        server_ip = resp.text.strip()
-    except Exception:
-        try:
-            result = subprocess.run(['curl', '-sm', '3', 'ipv4.ip.sb'],
-                                    capture_output=True, text=True, timeout=5)
-            server_ip = result.stdout.strip()
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                await ws.send_bytes(data)
         except Exception:
+            pass
+        finally:
             try:
-                resp = requests.get('http://ipv6.ip.sb', timeout=3)
-                server_ip = f'[{resp.text.strip()}]'
+                await ws.close()
             except Exception:
-                try:
-                    result = subprocess.run(['curl', '-sm', '3', 'ipv6.ip.sb'],
-                                            capture_output=True, text=True, timeout=5)
-                    server_ip = f'[{result.stdout.strip()}]'
-                except Exception as e:
-                    log_error(f'Failed to get IP address: {e}')
-    return server_ip
-
-# =========================== 生成节点链接 ===========================
-def generate_links(argo_domain):
-    global sub_txt_content
-
-    isp = get_meta_info()
-    node_name = f'{NAME}-{isp}' if NAME else isp
-    server_ip = get_server_ip()
-
-    time.sleep(2)
-
-    sub_txt = ''
-
-    # Argo 节点 (VLESS / VMess / Trojan)
-    if argo_domain:
-        sub_txt += f'\nvless://{UUID}@{CFIP}:{CFPORT}?encryption=none&security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Fvless-argo%3Fed%3D2560#{node_name}'
-
-        vmess_obj = {
-            'v': '2', 'ps': node_name, 'add': CFIP, 'port': CFPORT,
-            'id': UUID, 'aid': '0', 'scy': 'auto', 'net': 'ws',
-            'type': 'none', 'host': argo_domain, 'path': '/vmess-argo?ed=2560',
-            'tls': 'tls', 'sni': argo_domain, 'alpn': '', 'fp': 'firefox'
-        }
-        vmess_b64 = base64.b64encode(json.dumps(vmess_obj, separators=(',', ':')).encode()).decode()
-        sub_txt += f'\nvmess://{vmess_b64}'
-
-        sub_txt += f'\ntrojan://{UUID}@{CFIP}:{CFPORT}?security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Ftrojan-argo%3Fed%3D2560#{node_name}'
-
-    # Hysteria2 节点
-    if is_valid_port(HY2_PORT):
-        fingerprint = get_certificate_fingerprint(cert_path)
-        fingerprint_param = f'&pinSHA256={quote(fingerprint, safe="")}' if fingerprint else ''
-        sub_txt += f'\nhysteria2://{UUID}@{server_ip}:{HY2_PORT}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{fingerprint_param}#{node_name}'
-
-    # Reality 节点
-    if is_valid_port(REALITY_PORT):
-        sub_txt += f'\nvless://{UUID}@{server_ip}:{REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={public_key}&type=tcp&headerType=none#{node_name}'
-
-    # SOCKS5 节点
-    if is_valid_port(S5_PORT):
-        s5_auth = base64.b64encode(f'{UUID[:8]}:{UUID[-12:]}'.encode()).decode()
-        sub_txt += f'\nsocks://{s5_auth}@{server_ip}:{S5_PORT}#{node_name}'
-
-    sub_txt_b64 = base64.b64encode(sub_txt.encode()).decode()
-    if SHOW_LOG:
-        print(f'\033[32m{sub_txt_b64}\033[0m')
-        print(f'\033[35mLogs will be deleted in 90 seconds, you can copy the above nodes\033[0m')
-
-    sub_path.write_text(sub_txt_b64, encoding='utf-8')
-    list_path.write_text(sub_txt, encoding='utf-8')
-    log(f'{FILE_PATH}/sub.txt saved successfully')
-
-    sub_txt_content = sub_txt_b64
-    return sub_txt
-
-# =========================== Telegram 推送 ===========================
-def send_telegram():
-    if not BOT_TOKEN or not CHAT_ID:
-        log('TG variables is empty, Skipping push nodes to TG')
-        return
-    try:
-        message = sub_path.read_text(encoding='utf-8')
-        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-        escaped_name = re.sub(r'[_*\[\]()~`>#+=|{}.!-]', r'\\\g<0>', NAME)
-        params = {
-            'chat_id': CHAT_ID,
-            'text': f'**{escaped_name}节点推送通知**\n```{message}```',
-            'parse_mode': 'MarkdownV2'
-        }
-        requests.post(url, params=params, timeout=10)
-        log('Telegram message sent successfully')
-    except Exception as e:
-        log_error(f'Failed to send Telegram message: {e}')
-
-# =========================== 上传节点到订阅器 ===========================
-def upload_nodes():
-    if UPLOAD_URL and PROJECT_URL:
-        subscription_url = f'{PROJECT_URL}/{SUB_PATH}'
-        try:
-            resp = requests.post(f'{UPLOAD_URL}/api/add-subscriptions',
-                                 json={'subscription': [subscription_url]},
-                                 timeout=10)
-            if resp.status_code == 200:
-                log('Subscription uploaded successfully')
-        except Exception:
-            pass
-    elif UPLOAD_URL:
-        if not list_path.exists():
-            return
-        content = list_path.read_text(encoding='utf-8')
-        nodes = [line for line in content.split('\n')
-                 if re.match(r'(vless|vmess|trojan|hysteria2|socks)://', line)]
-        if not nodes:
-            return
-        try:
-            resp = requests.post(f'{UPLOAD_URL}/api/add-nodes',
-                                 json={'nodes': nodes},
-                                 timeout=10)
-            if resp.status_code == 200:
-                log('Nodes uploaded successfully')
-        except Exception:
-            pass
-
-# =========================== 自动保活 ===========================
-def add_visit_task():
-    if not AUTO_ACCESS or not PROJECT_URL:
-        log('Skipping adding automatic access task')
-        return
-    try:
-        requests.post('https://oooo.serv00.net/add-url',
-                      json={'url': PROJECT_URL},
-                      headers={'Content-Type': 'application/json'},
-                      timeout=10)
-        log('automatic access task added successfully')
-    except Exception as e:
-        log_error(f'Add URL failed: {e}')
-
-# =========================== 文件清理 ===========================
-def clean_files():
-    def cleanup():
-        time.sleep(90)
-        # 注意: key.txt/cert.pem/private.key 不能删除, 删除后重启会导致 Reality 公钥和 Hysteria2 证书指纹变化, 节点失效
-        files_to_delete = [boot_log_path, config_path, list_path, nezha_config_path,
-                           web_path, bot_path,
-                           FILE_PATH / 'tunnel.json', FILE_PATH / 'tunnel.yml']
-        if NEZHA_PORT:
-            files_to_delete.append(npm_path)
-        elif NEZHA_SERVER and NEZHA_KEY:
-            files_to_delete.append(php_path)
-
-        for f in files_to_delete:
-            try:
-                f.unlink()
-            except FileNotFoundError:
                 pass
 
-        if SHOW_LOG:
-            os.system('clear' if os.name == 'posix' else 'cls')
-        always_log('App is running')
-        log('Thank you for using this script, enjoy!')
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
 
-    t = threading.Thread(target=cleanup, daemon=True)
-    t.start()
 
-# =========================== HTTP 服务 ===========================
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+# ---- binary readers ------------------------------------------------------
+def _ipv6(buf):
+    return ':'.join(f'{(buf[k] << 8) + buf[k + 1]:x}' for k in range(0, 16, 2))
 
-        if path == f'/{SUB_PATH}':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(sub_txt_content.encode('utf-8'))
+
+def _read_address(msg, p):
+    """atyp + host，按 ATYP 顺序读；返回 (host, next_p)。"""
+    atyp = msg[p]
+    p += 1
+    if atyp == 1:
+        host = '.'.join(str(b) for b in msg[p:p + 4])
+        return host, p + 4
+    if atyp == 3:
+        n = msg[p]
+        p += 1
+        host = msg[p:p + n].decode('utf-8', 'ignore')
+        return host, p + n
+    if atyp == 4:
+        host = _ipv6(msg[p:p + 16])
+        return host, p + 16
+    raise ValueError('bad address type')
+
+
+# ---- protocol handlers (返回 True=接管连接, False=不是该协议继续试) -------
+async def handle_vless(ws, msg):
+    try:
+        version = msg[0]
+        for k in range(16):
+            if msg[1 + k] != int(NODE_ID_HEX[k * 2:k * 2 + 2], 16):
+                return False
+        if len(msg) < 18:
+            return False
+        off = msg[17] + 19  # VLE-SS 偏移
+        if len(msg) < off + 3:
+            return False
+        port = (msg[off] << 8) | msg[off + 1]
+        atyp = msg[off + 2]
+        if atyp == 1:
+            if len(msg) < off + 7:
+                return False
+            host = '.'.join(str(b) for b in msg[off + 3:off + 7])
+            end = off + 7
+        elif atyp == 2:
+            if len(msg) < off + 4:
+                return False
+            n = msg[off + 3]
+            if len(msg) < off + 4 + n:
+                return False
+            host = msg[off + 4:off + 4 + n].decode('utf-8', 'ignore')
+            end = off + 4 + n
+        elif atyp == 3:
+            if len(msg) < off + 19:
+                return False
+            host = _ipv6(msg[off + 3:off + 19])
+            end = off + 19
+        else:
+            return False
+        if is_protected_host(host):
+            await ws.close()
+            return True
+        await ws.send_bytes(bytes([version, 0]))
+        await open_tunnel(ws, host, port, msg[end:])
+        return True
+    except Exception:
+        return False
+
+
+_TROJAN_HASH = hashlib.sha224(NODE_ID.encode()).hexdigest()
+
+
+async def handle_trojan(ws, msg):
+    try:
+        if len(msg) < 58:
+            return False
+        if _TROJAN_HASH != msg[0:56].decode('ascii', 'ignore'):
+            return False
+        off = 56
+        if msg[off] == 0x0d and msg[off + 1] == 0x0a:
+            off += 2
+        if msg[off] != 0x01:  # cmd
+            return False
+        off += 1
+        host, off = _read_address(msg, off)
+        port = (msg[off] << 8) | msg[off + 1]
+        off += 2
+        if off + 1 < len(msg) and msg[off] == 0x0d and msg[off + 1] == 0x0a:
+            off += 2
+        if is_protected_host(host):
+            await ws.close()
+            return True
+        await open_tunnel(ws, host, port, msg[off:])
+        return True
+    except Exception:
+        return False
+
+
+async def handle_ss(ws, msg):
+    try:
+        if len(msg) == 0:
+            return False
+        atyp = msg[0]
+        if atyp not in (1, 3, 4):
+            return False
+        # SS(v2ray-plugin ws) 地址头后无 CRLF 分隔，紧跟 payload
+        host, off = _read_address(msg, 0)
+        port = (msg[off] << 8) | msg[off + 1]
+        off += 2
+        if is_protected_host(host):
+            await ws.close()
+            return True
+        await open_tunnel(ws, host, port, msg[off:])
+        return True
+    except Exception:
+        return False
+
+
+_HANDLERS = [
+    (lambda m: len(m) > 17 and m[0] == 0, handle_vless),
+    (lambda m: len(m) >= 58, handle_trojan),
+    (lambda m: len(m) > 0 and m[0] in (1, 3, 4), handle_ss),
+]
+
+
+async def dispatch(ws, msg):
+    for guard, handle in _HANDLERS:
+        if guard(msg) and await handle(ws, msg):
             return
+    await ws.close()
 
-        if path == '/':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(
-                b'Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) get your nodes!')
-            return
 
-        self.send_response(404)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b'Not Found')
+# ---- themed front page ---------------------------------------------------
+THEMES = [
+    {'name': 'green', 'title': 'Green Network', 'slogan': 'Protect Our Planet, Preserve Our Future',
+     'primary': '#2e7d32', 'secondary': '#4caf50', 'accent': '#8bc34a', 'dark': '#1b5e20', 'light': '#e8f5e9'},
+    {'name': 'ocean', 'title': 'Blue Horizon', 'slogan': 'Safeguarding the Seas for Tomorrow',
+     'primary': '#01579b', 'secondary': '#0288d1', 'accent': '#4fc3f7', 'dark': '#01378a', 'light': '#e1f5fe'},
+    {'name': 'forest', 'title': 'Wildwood', 'slogan': 'Where Every Root Tells a Story',
+     'primary': '#33691e', 'secondary': '#558b2f', 'accent': '#9ccc65', 'dark': '#1b5e20', 'light': '#f1f8e9'},
+    {'name': 'sunset', 'title': 'Golden Dunes', 'slogan': 'Chasing Light Across the Sands',
+     'primary': '#e65100', 'secondary': '#f57c00', 'accent': '#ffb74d', 'dark': '#bf360c', 'light': '#fff3e0'},
+    {'name': 'meadow', 'title': 'Willow Fields', 'slogan': 'Cultivating Calm, One Meadow at a Time',
+     'primary': '#4a148c', 'secondary': '#7b1fa2', 'accent': '#ba68c8', 'dark': '#311b92', 'light': '#f3e5f5'},
+    {'name': 'glacier', 'title': 'Northlight', 'slogan': "Preserving the World's Last Frozen Frontiers",
+     'primary': '#37474f', 'secondary': '#546e7a', 'accent': '#90a4ae', 'dark': '#263238', 'light': '#eceff1'},
+]
 
-    def log_message(self, format, *args):
-        pass
 
-# =========================== 主流程 ===========================
-def start_server():
-    global sub_txt_content
-
-    # 1. 删除旧节点
-    delete_nodes()
-
-    # 2. 创建运行目录 + 清理文件
-    create_directory()
-    cleanup_old_files()
-
-    # 3. 生成 Argo 隧道配置
-    argo_type()
-
-    # 4. 生成 Reality 密钥对 (仅当 REALITY_PORT 开启才生成)
-    if is_valid_port(REALITY_PORT):
-        generate_or_load_keypair()
-
-    # 5. 生成 TLS 证书 (用于 Hysteria2)
-    if is_valid_port(HY2_PORT):
-        ensure_tls_certificates(cert_path, key_path)
-
-    # 6. 生成 Xray 配置
-    generate_xray_config()
-
-    # 7. 下载并运行文件
-    download_files_and_run()
-
-    # 8. 提取隧道域名并生成节点
-    extract_domains()
-
-    # 9. Telegram 推送 + 节点上传 + 自动保活
-    send_telegram()
-    upload_nodes()
-    add_visit_task()
-
-    # 10. 90秒后清理文件
-    clean_files()
-
-# =========================== 信号处理 ===========================
-def stop_all(signum=None, frame=None):
-    """优雅关闭所有服务"""
-    def shutdown():
-        log('\nShutting down...')
+def pick_theme():
+    if SITE_THEME:
+        for t in THEMES:
+            if t['name'] == SITE_THEME:
+                return t
         try:
-            exec_cmd(f'pkill -f "{web_name}" > /dev/null 2>&1')
-            exec_cmd(f'pkill -f "{bot_name}" > /dev/null 2>&1')
-            if NEZHA_PORT:
-                exec_cmd(f'pkill -f "{npm_name}" > /dev/null 2>&1')
-            elif NEZHA_SERVER and NEZHA_KEY:
-                exec_cmd(f'pkill -f "{php_name}" > /dev/null 2>&1')
+            idx = int(SITE_THEME)
+            return THEMES[((idx % len(THEMES)) + len(THEMES)) % len(THEMES)]
+        except ValueError:
+            pass
+    return THEMES[random.randrange(len(THEMES))]
+
+
+def render_home():
+    try:
+        with open('index.html', 'r', encoding='utf-8') as f:
+            raw = f.read()
+    except OSError:
+        raw = '<!doctype html><html><head><title>{{TITLE}}</title></head><body>{{SLOGAN}}</body></html>'
+    t = pick_theme()
+    return (raw
+            .replace('{{TITLE}}', SITE_TITLE or t['title'])
+            .replace('{{SLOGAN}}', t['slogan'])
+            .replace('{{PRIMARY}}', t['primary'])
+            .replace('{{SECONDARY}}', t['secondary'])
+            .replace('{{ACCENT}}', t['accent'])
+            .replace('{{DARK}}', t['dark'])
+            .replace('{{LIGHT}}', t['light']))
+
+
+HOME_HTML = render_home()
+NOT_FOUND_HTML = ('<!DOCTYPE html>\n<html>\n<head><title>404 Not Found</title></head>\n<body>\n'
+                  '<center><h1>404 Not Found</h1></center>\n<hr><center>' + SERVER_HEADER +
+                  '</center>\n</body>\n</html>\n')
+
+
+# ---- http + ws -----------------------------------------------------------
+def _resp(status, body, ctype):
+    data = body if isinstance(body, (bytes, bytearray)) else str(body).encode('utf-8')
+    return web.Response(status=status, body=data,
+                        headers={'Server': SERVER_HEADER, 'Content-Type': ctype})
+
+
+async def handler(request):
+    # WS upgrade：握手前仅校验 path 前缀（不校验 Host，保持 CDN 反代兼容）
+    if request.headers.get('Upgrade', '').lower() == 'websocket':
+        if not request.path.startswith('/' + WSPATH):
+            return _resp(404, NOT_FOUND_HTML, 'text/html; charset=utf-8')
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        try:
+            first = await ws.receive(timeout=10)
+            if first.type == aiohttp.WSMsgType.BINARY:
+                await dispatch(ws, first.data)
+            else:
+                await ws.close()
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        return ws
+
+    p = request.path
+    if p == '/':
+        return _resp(200, HOME_HTML, 'text/html; charset=utf-8')
+    if p == '/favicon.ico':
+        return web.Response(status=204, headers={'Server': SERVER_HEADER})
+    if p == '/robots.txt':
+        return _resp(200, 'User-agent: *\nDisallow: /\n', 'text/plain')
+    if SUB_PATH and p == '/' + SUB_PATH:
+        if not meta_valid:
+            return _resp(503, 'Service Unavailable\n', 'text/plain')
+        return _resp(200, base64.b64encode(build_subscription().encode()).decode() + '\n', 'text/plain')
+    return _resp(404, NOT_FOUND_HTML, 'text/html; charset=utf-8')
+
+
+# ---- self destruct -------------------------------------------------------
+def _self_destruct():
+    for f in ['app.py', 'index.html', 'requirements.txt', 'npm', 'config.yaml']:
+        try:
+            os.remove(f)
+        except OSError:
+            pass  # 平台差异/运行中文件，忽略
+    try:
+        shutil.rmtree('__pycache__', ignore_errors=True)
+    except Exception:
+        pass
+    for k in SENSITIVE_ENV:
+        try:
+            os.environ.pop(k, None)  # CPython 调 unsetenv，更新 /proc/self/environ
         except Exception:
             pass
-        time.sleep(1)
-        os._exit(0)
+    logging.disable(logging.CRITICAL)
+    sys.excepthook = lambda *a: None
+    try:
+        asyncio.get_event_loop().set_exception_handler(lambda loop, ctx: None)
+    except Exception:
+        pass
+    try:
+        devnull = open(os.devnull, 'w')
+        sys.stdout = devnull
+        sys.stderr = devnull
+    except Exception:
+        pass
 
-    t = threading.Thread(target=shutdown, daemon=True)
-    t.start()
 
-# =========================== 入口 ===========================
+def arm_self_destruct(loop):
+    if not SELF_DESTRUCT:
+        return
+    loop.call_later(SELF_DESTRUCT_AFTER, _self_destruct)
+
+
+# ---- boot ----------------------------------------------------------------
+async def main():
+    app = web.Application()
+    app.router.add_route('*', '/{tail:.*}', handler)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f'listening on {PORT} (path /{WSPATH})')
+
+    await deliver()
+    arm_self_destruct(asyncio.get_event_loop())
+
+    try:
+        await asyncio.Future()
+    finally:
+        await runner.cleanup()
+
+
 if __name__ == '__main__':
-    signal.signal(signal.SIGINT, stop_all)
-    signal.signal(signal.SIGTERM, stop_all)
-
-    # 启动 HTTP 服务 (主线程)
-    server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
-
-    always_log(f'server is running on {PORT}!')
-
-    # 在后台线程中启动主流程
-    t = threading.Thread(target=start_server, daemon=True)
-    t.start()
-
-    # 主线程阻塞在 HTTP 服务器上
-    server.serve_forever()
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+    for name in ('aiohttp.access', 'aiohttp.server', 'aiohttp.client', 'aiohttp.internal', 'aiohttp.websocket'):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

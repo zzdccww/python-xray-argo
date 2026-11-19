@@ -91,13 +91,13 @@ def _read_index():
         return (
             "<!doctype html><html><head><meta charset='utf-8'></head>"
             "<body style='font-family:system-ui;padding:2rem'>"
-            "<h2>Green Network</h2></body></html>"
+            "<h2>Not found</h2></body></html>"
         )
 
 
 st.set_page_config(
-    page_title="Green Network - Protect Earth",
-    page_icon="🌱",
+    page_title="Freecat",
+    page_icon="🌿",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -110,17 +110,18 @@ st.markdown(
       [data-testid="stToolbar"], [data-testid="stDecoration"],
       [data-testid="stStatusWidget"], [data-testid="stSidebar"] { display: none !important; }
 
-      .stApp { background: #e8f5e9; }
+      .stApp { background: #fff; }
       .block-container,
       [data-testid="stAppViewBlockContainer"],
       section.main > div { padding: 0 !important; margin: 0 !important; max-width: 100% !important; }
 
       [data-testid="stAppViewContainer"] { padding: 0 !important; }
       [data-testid="stVerticalBlock"] { gap: 0 !important; }
-      iframe { border: 0 !important; display: block; }
+      [data-testid="stVerticalBlockBorderWrapper"] { padding: 0 !important; }
+      iframe { border: 0 !important; display: block; width: 100% !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-components.html(_read_index(), height=1400, scrolling=True)
+components.html(_read_index(), height=3000, scrolling=True)

@@ -1,0 +1,122 @@
+name: Streamlit keep-alive
+
+# 保活工作流：定期访问 Streamlit Community Cloud 应用，防止因 12 小时无流量休眠
+# 参考实现：https://github.com/ghfkd0901/streamlit-keepalive
+#
+# 使用说明：
+#   1. 本文件放在 .github/workflows/keepalive.yml
+#   2. 需要保活的应用地址逐行填在下面 APPS 里（# 开头的行会被忽略）
+#   3. 也可在 Actions → Streamlit keep-alive → Run workflow 手动触发
+
+on:
+  schedule:
+    # 每 6 小时一次（UTC）。Streamlit 休眠阈值是 12 小时，6 小时可留足容错
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 同时访问的应用数量
+  CONCURRENCY: "4"
+  # 应用清单。一行一个，留空或 # 开头的行忽略
+  APPS: |
+    https://zzdccww.streamlit.app/
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install --quiet playwright
+          # Ubuntu runner 已自带 chrome，优先复用；没有才装 chromium（约 10 分钟）
+          if command -v google-chrome >/dev/null; then
+            echo "reuse preinstalled chrome: $(google-chrome --version)"
+          else
+            python -m playwright install --with-deps chromium
+          fi
+
+      - name: Wake each app
+        id: wake
+        run: |
+          python - <<'PY'
+          import asyncio, os, shutil, sys
+          from playwright.async_api import async_playwright
+
+          urls = [u.strip() for u in os.environ["APPS"].splitlines()
+                  if u.strip() and not u.strip().startswith("#")]
+          sem = asyncio.Semaphore(int(os.environ.get("CONCURRENCY", "4")))
+          results = {}
+
+          async def visit(browser, url):
+              async with sem:
+                  page = await browser.new_page()
+                  try:
+                      await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                      await page.wait_for_timeout(10_000)
+
+                      # 休眠中的应用会显示这个按钮，点它即可唤醒
+                      btn = page.get_by_role("button", name="Yes, get this app back up!")
+                      if await btn.count():
+                          await btn.click()
+                          await page.wait_for_timeout(90_000)
+                          results[url] = "woke"
+                      else:
+                          # 已醒着：再停留一会儿，确保真的产生了流量
+                          await page.wait_for_timeout(20_000)
+                          results[url] = "alive"
+                  except Exception as e:
+                      results[url] = f"failed:{type(e).__name__}"
+                  finally:
+                      await page.close()
+
+          async def main():
+              async with async_playwright() as p:
+                  channel = "chrome" if shutil.which("google-chrome") else None
+                  browser = await p.chromium.launch(channel=channel)
+                  await asyncio.gather(*(visit(browser, u) for u in urls))
+                  await browser.close()
+
+          asyncio.run(main())
+
+          for u in urls:
+              print(f"[{results.get(u, '?')}] {u}")
+          woke    = sum(r == "woke"   for r in results.values())
+          alive   = sum(r == "alive"  for r in results.values())
+          failed  = [u for u, r in results.items() if r.startswith("failed")]
+          print(f"\ntotal={len(urls)} woke={woke} alive={alive} failed={len(failed)}")
+          if failed:
+              print("FAILED: " + ", ".join(failed))
+              sys.exit(1)
+          PY
+
+      # GitHub 对 60 天无提交的仓库会自动停用 schedule 触发，
+      # 所以超过 50 天没活动时，写一个时间戳文件提交一下，把定时器续上
+      - name: Keep schedule alive
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age=$(( (now - last) / 86400 ))
+          echo "last commit age: ${age} day(s)"
+          if [ "$age" -ge 50 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive-stamp
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .keepalive-stamp
+            git commit -m "chore(keepalive): refresh schedule activity stamp"
+            git push
+          else
+            echo "no commit needed"
+          fi
